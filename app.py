@@ -18,7 +18,8 @@ from gtts import gTTS
 from pptx import Presentation
 from pypdf import PdfReader
 
-DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_ANSWER_MODEL = "gemini-3.8-flash"
+DEFAULT_SUMMARY_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768
 EMBED_BATCH = 64
@@ -26,11 +27,45 @@ EMBED_WORKERS = 4
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
 MAX_CHUNKS = 400
-RETRIEVAL_K = 4
+RETRIEVAL_K = 8
 SUMMARY_GROUP_CHARS = 8000
 SHORT_DOCUMENT_CHARS = 12000
 HISTORY_TURNS = 6
 TTS_CHAR_LIMIT = 4500
+
+STOP_WORDS = {
+    "about",
+    "and",
+    "are",
+    "can",
+    "for",
+    "from",
+    "how",
+    "that",
+    "the",
+    "this",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "you",
+    "your",
+}
+
+QUESTION_REQUESTS = (
+    "what can i ask",
+    "what questions",
+    "questions can i ask",
+    "questions that i can ask",
+    "questions should i ask",
+    "suggest questions",
+    "what should i ask",
+    "give me questions",
+    "questions to ask",
+)
 
 INSTANT_STARTERS = [
     "What is this document about?",
@@ -319,6 +354,59 @@ def build_index(vectors):
     return index
 
 
+def keywords(text):
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]+", text.lower())
+        if len(word) > 2 and word not in STOP_WORDS
+    }
+
+
+def asks_for_questions(question):
+    text = question.lower()
+    return any(phrase in text for phrase in QUESTION_REQUESTS)
+
+
+def select_sources(chunks, hits, question, limit=RETRIEVAL_K):
+    semantic = [
+        (chunk_id, score)
+        for chunk_id, score in hits
+        if 0 <= chunk_id < len(chunks)
+    ]
+    chosen = []
+    seen = set()
+    for chunk_id, score in semantic[:5]:
+        chosen.append(chunk_id)
+        seen.add(chunk_id)
+    wanted = keywords(question)
+    lexical = []
+    for index, chunk in enumerate(chunks):
+        if index in seen:
+            continue
+        overlap = wanted & keywords(f"{chunk['source']} {chunk['text']}")
+        if overlap:
+            lexical.append((len(overlap), index))
+    lexical.sort(key=lambda item: (-item[0], item[1]))
+    for _count, index in lexical:
+        if len(chosen) >= limit:
+            break
+        chosen.append(index)
+        seen.add(index)
+    for chunk_id, _score in semantic:
+        if len(chosen) >= limit:
+            break
+        if chunk_id not in seen:
+            chosen.append(chunk_id)
+            seen.add(chunk_id)
+    scores = dict(semantic)
+    sources = []
+    for chunk_id in chosen:
+        source = dict(chunks[chunk_id])
+        source["score"] = scores.get(chunk_id)
+        sources.append(source)
+    return sources
+
+
 def search_index(index, query_vector, k):
     scores, ids = index.search(query_vector, k)
     found = []
@@ -328,11 +416,9 @@ def search_index(index, query_vector, k):
     return found
 
 
-def generate_text(client, chat_model, prompt):
+def generate_text(client, chat_model, prompt, thinking_level=types.ThinkingLevel.MINIMAL):
     config = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(
-            thinking_level=types.ThinkingLevel.MINIMAL
-        )
+        thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
     )
     try:
         response = client.models.generate_content(
@@ -436,6 +522,35 @@ def history_text(messages):
     return "\n".join(lines)
 
 
+def excerpts_text(sources):
+    return "\n\n".join(
+        f"Source: {source['source']} ({source['location']})\n{source['text']}"
+        for source in sources
+    )
+
+
+def answer_prompt(question, language, excerpts, prior):
+    if asks_for_questions(question):
+        return (
+            "The reader wants questions they can ask about the uploaded documents.\n"
+            f"Using only the excerpts, write 4 specific questions in {language}.\n"
+            "Put one question on each line. Do not answer the questions.\n\n"
+            f"Excerpts:\n{excerpts}"
+        )
+    return (
+        "Answer the question using the excerpts.\n"
+        f"Write the answer in {language}.\n"
+        "Connect the wording of the question to related terms in the excerpts.\n"
+        "If the excerpts contain the relevant explanation, state it directly.\n"
+        "If they contain only part of the answer, give that part.\n"
+        "Say that the answer is not available in the documents only when the excerpts do not discuss the topic.\n"
+        "Do not add facts that the excerpts do not support.\n\n"
+        f"Conversation so far:\n{prior or '(none)'}\n\n"
+        f"Excerpts:\n{excerpts}\n\n"
+        f"Question: {question}"
+    )
+
+
 def answer_question(client, chat_model, embed_model, index, chunks, question, language, messages):
     query = embed_texts(
         client,
@@ -443,26 +558,22 @@ def answer_question(client, chat_model, embed_model, index, chunks, question, la
         embed_model,
     )
     hits = search_index(index, query, min(RETRIEVAL_K, len(chunks)))
-    sources = []
-    for chunk_id, score in hits:
-        source = dict(chunks[chunk_id])
-        source["score"] = score
-        sources.append(source)
-    excerpts = "\n\n".join(
-        f"Source: {source['source']} ({source['location']})\n{source['text']}"
-        for source in sources
+    sources = select_sources(chunks, hits, question)
+    prompt = answer_prompt(
+        question,
+        language,
+        excerpts_text(sources),
+        history_text(messages),
     )
-    prior = history_text(messages)
-    prompt = (
-        "Answer the question from the uploaded documents.\n"
-        f"Write the answer in {language}.\n"
-        "Use only the excerpts below. If they do not contain the answer, say that "
-        "the answer is not available in the documents. Do not invent facts.\n\n"
-        f"Conversation so far:\n{prior or '(none)'}\n\n"
-        f"Excerpts:\n{excerpts}\n\n"
-        f"Question: {question}"
+    return (
+        generate_text(
+            client,
+            chat_model,
+            prompt,
+            thinking_level=types.ThinkingLevel.LOW,
+        ),
+        sources,
     )
-    return generate_text(client, chat_model, prompt), sources
 
 
 def synthesize_speech(text, lang):
@@ -613,7 +724,7 @@ def render_empty_state():
     third.markdown("**3. Ask**\n\nChat, summarize, or listen to the reply.")
 
 
-def sidebar(api_key, client, chat_model, embed_model, secret_problems, secret_names):
+def sidebar(api_key, client, answer_model, summary_model, embed_model, secret_problems, secret_names):
     st.header("Documents")
     uploads = st.file_uploader(
         "Upload PDF, DOCX, or PPTX files",
@@ -688,7 +799,7 @@ def sidebar(api_key, client, chat_model, embed_model, secret_problems, secret_na
             with st.spinner("Writing the summary..."):
                 summary = summarize_documents(
                     client,
-                    chat_model,
+                    summary_model,
                     st.session_state.chunks,
                     LANGUAGES[language_code],
                     summary_length,
@@ -722,7 +833,7 @@ def sidebar(api_key, client, chat_model, embed_model, secret_problems, secret_na
         st.rerun()
 
     st.divider()
-    st.caption(f"Answers use {chat_model}.")
+    st.caption(f"Answers use {answer_model}.")
     st.caption("This session's index stays in memory and is cleared when you refresh.")
     return language_code
 
@@ -762,7 +873,8 @@ def main():
     init_state()
     secrets, secret_problems = load_secrets()
     api_key = api_key_from(secrets)
-    chat_model = secrets.get("GEMINI_MODEL") or DEFAULT_CHAT_MODEL
+    answer_model = secrets.get("GEMINI_MODEL") or DEFAULT_ANSWER_MODEL
+    summary_model = DEFAULT_SUMMARY_MODEL
     embed_model = secrets.get("EMBED_MODEL") or DEFAULT_EMBED_MODEL
     client = get_client(api_key) if api_key else None
 
@@ -773,7 +885,8 @@ def main():
         language_code = sidebar(
             api_key,
             client,
-            chat_model,
+            answer_model,
+            summary_model,
             embed_model,
             secret_problems,
             sorted(secrets),
@@ -812,14 +925,14 @@ def main():
         for number, question in enumerate(st.session_state.starters):
             column = left if number % 2 == 0 else right
             if column.button(question, key=f"starter-{number}", width="stretch"):
-                ask(client, chat_model, embed_model, question, language_code)
+                ask(client, answer_model, embed_model, question, language_code)
 
     prompt = st.chat_input(
         "Ask a question about the documents",
         disabled=st.session_state.index is None,
     )
     if prompt:
-        ask(client, chat_model, embed_model, prompt, language_code)
+        ask(client, answer_model, embed_model, prompt, language_code)
 
 
 if __name__ == "__main__":
