@@ -52,15 +52,17 @@ def public_error(exc):
 
 def read_setting(name, default=None):
     load_dotenv()
-    secrets_path = os.path.join(".streamlit", "secrets.toml")
-    if os.path.exists(secrets_path):
-        try:
-            value = st.secrets.get(name)
-            if value:
-                return value
-        except Exception:
-            pass
-    return os.getenv(name) or default
+    try:
+        # Streamlit Cloud keeps dashboard secrets in st.secrets, not in the
+        # gitignored project file, so this has to be checked unconditionally.
+        if name in st.secrets:
+            value = st.secrets[name]
+            if value not in (None, ""):
+                return str(value)
+    except Exception:
+        pass
+    env_value = os.getenv(name)
+    return env_value if env_value else default
 
 
 @st.cache_resource(show_spinner=False)
@@ -596,6 +598,12 @@ def sidebar(api_key, client, chat_model, embed_model):
             st.error(f"Could not process those files. {public_error(exc)}")
 
     documents_ready = st.session_state.index is not None
+    if uploads and not api_key:
+        st.caption("Processing stays off until the app can read GOOGLE_API_KEY.")
+    elif api_key and not uploads:
+        st.caption("Upload a file to enable processing.")
+    elif api_key and uploads and not documents_ready:
+        st.caption("Summarize turns on after processing finishes.")
     if st.button(
         "Summarize",
         disabled=not (api_key and documents_ready),
