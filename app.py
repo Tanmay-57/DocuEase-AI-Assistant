@@ -1,7 +1,10 @@
 import io
 import os
 import re
+import tomllib
 from collections import Counter
+from collections.abc import Mapping
+from pathlib import Path
 
 import faiss
 import numpy as np
@@ -43,26 +46,78 @@ class DocumentError(Exception):
 
 def public_error(exc):
     message = " ".join(str(exc).split())
+    message = re.sub(r"[A-Za-z0-9._\-]{24,}", "[hidden]", message)
     if "API_KEY_INVALID" in message or "API key not valid" in message:
-        return "The Google API key was rejected. Check GOOGLE_API_KEY in secrets or .env."
+        return "The Google API key was rejected. Check GOOGLE_API_KEY in the Streamlit Cloud secrets."
     if len(message) > 280:
         message = message[:280] + "..."
     return message
 
 
-def read_setting(name, default=None):
+SECRET_NAMES = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENAI_API_KEY")
+
+
+def _clean_secret(value):
+    text = str(value).strip().strip('"').strip("'")
+    return text or None
+
+
+def _flatten_secrets(data):
+    flat = {}
+    if not isinstance(data, Mapping):
+        return flat
+    for key, value in data.items():
+        if isinstance(value, Mapping):
+            flat.update(_flatten_secrets(value))
+        else:
+            cleaned = _clean_secret(value)
+            if cleaned:
+                flat[str(key)] = cleaned
+    return flat
+
+
+def _secret_file_paths():
+    paths = [
+        Path.home() / ".streamlit" / "secrets.toml",
+        Path.cwd() / ".streamlit" / "secrets.toml",
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+    ]
+    unique = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def load_secrets():
+    """Return secret values and any safe-to-show load problems."""
     load_dotenv()
+    merged = {}
+    problems = []
     try:
-        # Streamlit Cloud keeps dashboard secrets in st.secrets, not in the
-        # gitignored project file, so this has to be checked unconditionally.
-        if name in st.secrets:
-            value = st.secrets[name]
-            if value not in (None, ""):
-                return str(value)
-    except Exception:
-        pass
-    env_value = os.getenv(name)
-    return env_value if env_value else default
+        merged.update(_flatten_secrets(dict(st.secrets)))
+    except Exception as exc:
+        problems.append(public_error(exc))
+    for path in _secret_file_paths():
+        if not path.is_file():
+            continue
+        try:
+            with path.open("rb") as handle:
+                merged.update(_flatten_secrets(tomllib.load(handle)))
+        except Exception as exc:
+            problems.append(f"{path.name}: {public_error(exc)}")
+    for name in ("GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_GENAI_API_KEY", "GEMINI_MODEL", "EMBED_MODEL"):
+        env_value = os.getenv(name)
+        if env_value:
+            merged[name] = _clean_secret(env_value)
+    return merged, problems
+
+
+def api_key_from(secrets):
+    for name in SECRET_NAMES:
+        if secrets.get(name):
+            return secrets[name]
+    return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -555,7 +610,7 @@ def render_empty_state():
     third.markdown("**3. Ask**\n\nChat, summarize, or listen to the reply.")
 
 
-def sidebar(api_key, client, chat_model, embed_model):
+def sidebar(api_key, client, chat_model, embed_model, secret_problems, secret_names):
     st.header("Documents")
     uploads = st.file_uploader(
         "Upload PDF, DOCX, or PPTX files",
@@ -598,11 +653,20 @@ def sidebar(api_key, client, chat_model, embed_model):
             st.error(f"Could not process those files. {public_error(exc)}")
 
     documents_ready = st.session_state.index is not None
-    if uploads and not api_key:
-        st.caption("Processing stays off until the app can read GOOGLE_API_KEY.")
-    elif api_key and not uploads:
+    if not api_key:
+        st.warning("Processing stays off because this server has no GOOGLE_API_KEY.")
+        if secret_problems:
+            for problem in secret_problems:
+                st.caption(problem)
+        elif secret_names:
+            st.caption("Saved secret names: " + ", ".join(secret_names))
+        else:
+            st.caption("No secrets are saved for this deployed app.")
+        st.caption("In Streamlit Cloud, open Settings, then Secrets, and save this. The local secrets file is not deployed.")
+        st.code('GOOGLE_API_KEY = "your-key"', language="toml")
+    elif not uploads:
         st.caption("Upload a file to enable processing.")
-    elif api_key and uploads and not documents_ready:
+    elif not documents_ready:
         st.caption("Summarize turns on after processing finishes.")
     if st.button(
         "Summarize",
@@ -649,8 +713,6 @@ def sidebar(api_key, client, chat_model, embed_model):
     st.divider()
     st.caption(f"Answers use {chat_model}.")
     st.caption("This session's index stays in memory and is cleared when you refresh.")
-    if not api_key:
-        st.warning("Add a Google AI Studio key before processing files.")
     return language_code
 
 
@@ -687,16 +749,24 @@ def main():
         initial_sidebar_state="expanded",
     )
     init_state()
-    api_key = read_setting("GOOGLE_API_KEY")
-    chat_model = read_setting("GEMINI_MODEL", DEFAULT_CHAT_MODEL)
-    embed_model = read_setting("EMBED_MODEL", DEFAULT_EMBED_MODEL)
+    secrets, secret_problems = load_secrets()
+    api_key = api_key_from(secrets)
+    chat_model = secrets.get("GEMINI_MODEL") or DEFAULT_CHAT_MODEL
+    embed_model = secrets.get("EMBED_MODEL") or DEFAULT_EMBED_MODEL
     client = get_client(api_key) if api_key else None
 
     st.title("DocuEase")
     st.caption("Ask questions about PDF, Word, and PowerPoint files.")
 
     with st.sidebar:
-        language_code = sidebar(api_key, client, chat_model, embed_model)
+        language_code = sidebar(
+            api_key,
+            client,
+            chat_model,
+            embed_model,
+            secret_problems,
+            sorted(secrets),
+        )
 
     notice = st.session_state.notice
     if notice:
@@ -705,8 +775,9 @@ def main():
 
     if not api_key:
         st.warning(
-            "Add `GOOGLE_API_KEY` to `.streamlit/secrets.toml` or a local `.env` file, "
-            "then restart the app. On Streamlit Cloud, paste the same value into the app secrets."
+            "This deployed app cannot see GOOGLE_API_KEY. "
+            "Open the app in Streamlit Cloud, choose Settings, then Secrets, and save "
+            '`GOOGLE_API_KEY = "your-key"`. Reboot the app after saving.'
         )
         render_empty_state()
         return
