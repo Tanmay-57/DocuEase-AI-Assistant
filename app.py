@@ -4,6 +4,7 @@ import re
 import tomllib
 from collections import Counter
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import faiss
@@ -17,10 +18,11 @@ from gtts import gTTS
 from pptx import Presentation
 from pypdf import PdfReader
 
-DEFAULT_CHAT_MODEL = "gemini-3.8-flash"
+DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768
-EMBED_BATCH = 16
+EMBED_BATCH = 64
+EMBED_WORKERS = 4
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
 MAX_CHUNKS = 400
@@ -29,6 +31,13 @@ SUMMARY_GROUP_CHARS = 8000
 SHORT_DOCUMENT_CHARS = 12000
 HISTORY_TURNS = 6
 TTS_CHAR_LIMIT = 4500
+
+INSTANT_STARTERS = [
+    "What is this document about?",
+    "What are the key points?",
+    "What names, dates, or figures does it mention?",
+    "Give a short summary.",
+]
 
 LANGUAGES = {
     "en": "English",
@@ -253,29 +262,51 @@ def content_for(text):
     return types.Content(parts=[types.Part.from_text(text=text)])
 
 
-def embed_texts(client, texts, embed_model):
-    vectors = []
-    for offset in range(0, len(texts), EMBED_BATCH):
-        batch = texts[offset : offset + EMBED_BATCH]
-        result = client.models.embed_content(
-            model=embed_model,
-            contents=[content_for(text) for text in batch],
-            config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
+def embed_batch(client, embed_model, batch):
+    result = client.models.embed_content(
+        model=embed_model,
+        contents=[content_for(text) for text in batch],
+        config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
+    )
+    embeddings = result.embeddings or []
+    if len(embeddings) != len(batch):
+        raise RuntimeError(
+            "The embedding service returned an unexpected number of vectors."
         )
-        embeddings = result.embeddings or []
-        if len(embeddings) != len(batch):
-            raise RuntimeError(
-                "The embedding service returned an unexpected number of vectors."
-            )
-        for embedding in embeddings:
-            values = getattr(embedding, "values", None)
-            if not values:
-                raise RuntimeError("The embedding service returned an empty vector.")
-            vector = np.asarray(values, dtype="float32")
-            if vector.shape[0] > EMBED_DIM:
-                vector = vector[:EMBED_DIM]
-            vectors.append(vector)
-    matrix = np.vstack(vectors).astype("float32")
+    vectors = []
+    for embedding in embeddings:
+        values = getattr(embedding, "values", None)
+        if not values:
+            raise RuntimeError("The embedding service returned an empty vector.")
+        vector = np.asarray(values, dtype="float32")
+        if vector.shape[0] > EMBED_DIM:
+            vector = vector[:EMBED_DIM]
+        vectors.append(vector)
+    return np.vstack(vectors).astype("float32")
+
+
+def embed_texts(client, texts, embed_model, on_progress=None):
+    if not texts:
+        raise RuntimeError("There is no text to index.")
+    batches = [
+        texts[offset : offset + EMBED_BATCH]
+        for offset in range(0, len(texts), EMBED_BATCH)
+    ]
+    ordered = [None] * len(batches)
+    completed = 0
+    workers = min(EMBED_WORKERS, len(batches))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(embed_batch, client, embed_model, batch): index
+            for index, batch in enumerate(batches)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            ordered[index] = future.result()
+            completed += len(batches[index])
+            if on_progress:
+                on_progress(completed, len(texts))
+    matrix = np.vstack(ordered).astype("float32")
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1
     return matrix / norms
@@ -298,7 +329,19 @@ def search_index(index, query_vector, k):
 
 
 def generate_text(client, chat_model, prompt):
-    response = client.models.generate_content(model=chat_model, contents=prompt)
+    config = types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(
+            thinking_level=types.ThinkingLevel.MINIMAL
+        )
+    )
+    try:
+        response = client.models.generate_content(
+            model=chat_model, contents=prompt, config=config
+        )
+    except Exception as exc:
+        if "thinking" not in str(exc).lower():
+            raise
+        response = client.models.generate_content(model=chat_model, contents=prompt)
     text = (getattr(response, "text", None) or "").strip()
     if not text:
         raise RuntimeError("The model returned an empty response.")
@@ -315,21 +358,6 @@ def labeled_text(chunks, limit=None):
         parts.append(block)
         used += len(block)
     return "\n\n".join(parts)
-
-
-def sample_document(chunks, limit=8000):
-    full = "\n\n".join(chunk["text"] for chunk in chunks)
-    if len(full) <= limit:
-        return full
-    third = max(limit // 3, 1)
-    middle = max(len(full) // 2 - third // 2, 0)
-    return "\n\n".join(
-        [
-            full[:third],
-            full[middle : middle + third],
-            full[-third:],
-        ]
-    )
 
 
 def group_chunks(chunks, limit):
@@ -358,35 +386,19 @@ def summary_instruction(length):
     return "Write a concise summary in one short paragraph."
 
 
-def make_brief(client, chat_model, chunks, language):
+def summarize_group(client, chat_model, group, language):
     prompt = (
-        f"In 3 to 5 sentences, describe what these documents are about. "
-        f"Write in {language}. Use only the text below.\n\n"
-        f"{sample_document(chunks)}"
+        "Summarize this part of a longer document. Keep names, dates, and figures. "
+        f"Write in {language}.\n\n{labeled_text(group)}"
     )
     return generate_text(client, chat_model, prompt)
-
-
-def make_starters(client, chat_model, chunks, language):
-    prompt = (
-        "Suggest exactly 4 short questions a reader could ask about these documents. "
-        f"Write the questions in {language}. "
-        "Return only the questions, one per line, with no numbering.\n\n"
-        f"{sample_document(chunks, limit=6000)}"
-    )
-    raw = generate_text(client, chat_model, prompt)
-    questions = []
-    for line in raw.splitlines():
-        line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
-        if line:
-            questions.append(line)
-    return questions[:4]
 
 
 def summarize_documents(client, chat_model, chunks, language, length):
     instruction = summary_instruction(length)
     full = labeled_text(chunks)
-    if len(full) <= SHORT_DOCUMENT_CHARS:
+    groups = group_chunks(chunks, SUMMARY_GROUP_CHARS)
+    if len(full) <= SHORT_DOCUMENT_CHARS or len(groups) == 1:
         prompt = (
             f"{instruction} Write in {language}. "
             "Use only the document text below.\n\n"
@@ -394,13 +406,14 @@ def summarize_documents(client, chat_model, chunks, language, length):
         )
         return generate_text(client, chat_model, prompt)
 
-    partials = []
-    for group in group_chunks(chunks, SUMMARY_GROUP_CHARS):
-        prompt = (
-            "Summarize this part of a longer document. Keep names, dates, and figures. "
-            f"Write in {language}.\n\n{labeled_text(group)}"
+    workers = min(EMBED_WORKERS, len(groups))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        partials = list(
+            pool.map(
+                lambda group: summarize_group(client, chat_model, group, language),
+                groups,
+            )
         )
-        partials.append(generate_text(client, chat_model, prompt))
     combined = "\n\n".join(
         f"Part {number}:\n{text}" for number, text in enumerate(partials, start=1)
     )
@@ -492,7 +505,7 @@ def reset_documents():
     st.session_state.uploader_key += 1
 
 
-def index_documents(client, chat_model, embed_model, files, language):
+def index_documents(client, embed_model, files, on_progress=None):
     passages, skipped, unsupported = extract_files(files)
     if unsupported:
         names = ", ".join(unsupported)
@@ -508,7 +521,7 @@ def index_documents(client, chat_model, embed_model, files, language):
     embed_inputs = [
         f"title: {chunk['source']} | text: {chunk['text']}" for chunk in chunks
     ]
-    vectors = embed_texts(client, embed_inputs, embed_model)
+    vectors = embed_texts(client, embed_inputs, embed_model, on_progress=on_progress)
     index = build_index(vectors)
     notes = []
     if skipped:
@@ -521,23 +534,13 @@ def index_documents(client, chat_model, embed_model, files, language):
         notes.append(
             f"Only the first {MAX_CHUNKS} sections were indexed so this session stays responsive."
         )
-    brief = ""
-    starters = []
-    try:
-        brief = make_brief(client, chat_model, chunks, language)
-    except Exception:
-        notes.append("A short brief could not be generated. You can still ask questions.")
-    try:
-        starters = make_starters(client, chat_model, chunks, language)
-    except Exception:
-        notes.append("Suggested questions could not be generated.")
     return {
         "index": index,
         "chunks": chunks,
         "skipped": skipped,
         "truncated": truncated,
-        "brief": brief,
-        "starters": starters,
+        "brief": "",
+        "starters": list(INSTANT_STARTERS),
         "notes": notes,
     }
 
@@ -635,14 +638,20 @@ def sidebar(api_key, client, chat_model, embed_model, secret_problems, secret_na
         disabled=not ready,
         width="stretch",
     ):
+        progress = st.progress(0.0, text="Indexing sections...")
         try:
+
+            def on_progress(done, total):
+                progress.progress(
+                    done / total, text=f"Indexed {done} of {total} sections"
+                )
+
             with st.spinner("Reading and indexing your files..."):
                 result = index_documents(
                     client,
-                    chat_model,
                     embed_model,
                     uploads,
-                    LANGUAGES[language_code],
+                    on_progress=on_progress,
                 )
             store_index(result)
             st.session_state.notice = "Documents are ready."
@@ -651,6 +660,8 @@ def sidebar(api_key, client, chat_model, embed_model, secret_problems, secret_na
             st.error(str(exc))
         except Exception as exc:
             st.error(f"Could not process those files. {public_error(exc)}")
+        finally:
+            progress.empty()
 
     documents_ready = st.session_state.index is not None
     if not api_key:

@@ -56,7 +56,8 @@ GOOGLE_API_KEY = "your-key"
 Optional secret overrides:
 
 ```toml
-GEMINI_MODEL = "gemini-3.8-flash"
+# Optional. The default chat model is gemini-3.5-flash-lite.
+# GEMINI_MODEL = "gemini-3.8-flash"
 EMBED_MODEL = "gemini-embedding-2"
 ```
 
