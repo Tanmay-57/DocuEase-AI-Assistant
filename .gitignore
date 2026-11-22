@@ -1,1 +1,8 @@
 .env
+.streamlit/secrets.toml
+faiss_index/
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/

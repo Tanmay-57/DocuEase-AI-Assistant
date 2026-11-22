@@ -1,187 +1,736 @@
-import streamlit as st
-from PyPDF2 import PdfReader
-from docx import Document
-from pptx import Presentation
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import google.generativeai as genai
-from langchain_community.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from dotenv import load_dotenv
-from gtts import gTTS
-from googletrans import Translator
 import io
 import os
+import re
+from collections import Counter
 
-load_dotenv()
-api_key = os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=api_key)
+import faiss
+import numpy as np
+import streamlit as st
+from docx import Document
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from gtts import gTTS
+from pptx import Presentation
+from pypdf import PdfReader
 
-translator = Translator()
+DEFAULT_CHAT_MODEL = "gemini-3.8-flash"
+DEFAULT_EMBED_MODEL = "gemini-embedding-2"
+EMBED_DIM = 768
+EMBED_BATCH = 16
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 200
+MAX_CHUNKS = 400
+RETRIEVAL_K = 4
+SUMMARY_GROUP_CHARS = 8000
+SHORT_DOCUMENT_CHARS = 12000
+HISTORY_TURNS = 6
+TTS_CHAR_LIMIT = 4500
 
 LANGUAGES = {
     "en": "English",
     "es": "Spanish",
     "fr": "French",
     "de": "German",
-    "zh-cn": "Chinese (Simplified)",
-    "hi": "Hindi"
+    "zh-CN": "Chinese (Simplified)",
+    "hi": "Hindi",
 }
 
-def extract_text_from_pdf(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
 
-def extract_text_from_docx(docx_docs):
-    text = ""
-    for docx in docx_docs:
-        doc = Document(docx)
-        for para in doc.paragraphs:
-            text += para.text + "\n"
-    return text
+class DocumentError(Exception):
+    """A problem the user can fix by choosing different files."""
 
-def extract_text_from_pptx(pptx_docs):
-    text = ""
-    for pptx in pptx_docs:
-        presentation = Presentation(pptx)
-        for slide in presentation.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    text += shape.text + "\n"
-    return text
 
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
-    chunks = text_splitter.split_text(text)
+def public_error(exc):
+    message = " ".join(str(exc).split())
+    if "API_KEY_INVALID" in message or "API key not valid" in message:
+        return "The Google API key was rejected. Check GOOGLE_API_KEY in secrets or .env."
+    if len(message) > 280:
+        message = message[:280] + "..."
+    return message
+
+
+def read_setting(name, default=None):
+    load_dotenv()
+    secrets_path = os.path.join(".streamlit", "secrets.toml")
+    if os.path.exists(secrets_path):
+        try:
+            value = st.secrets.get(name)
+            if value:
+                return value
+        except Exception:
+            pass
+    return os.getenv(name) or default
+
+
+@st.cache_resource(show_spinner=False)
+def get_client(api_key):
+    return genai.Client(api_key=api_key)
+
+
+def clean_text(text):
+    text = (text or "").replace("\x00", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_pdf(file):
+    file.seek(0)
+    reader = PdfReader(file)
+    passages = []
+    for number, page in enumerate(reader.pages, start=1):
+        text = clean_text(page.extract_text())
+        if text:
+            passages.append(
+                {"source": file.name, "location": f"Page {number}", "text": text}
+            )
+    return passages
+
+
+def extract_docx(file):
+    file.seek(0)
+    document = Document(file)
+    lines = [clean_text(paragraph.text) for paragraph in document.paragraphs]
+    lines = [line for line in lines if line]
+    for table in document.tables:
+        for row in table.rows:
+            cells = []
+            for cell in row.cells:
+                value = clean_text(cell.text)
+                if value and (not cells or cells[-1] != value):
+                    cells.append(value)
+            if cells:
+                lines.append(" | ".join(cells))
+    text = clean_text("\n".join(lines))
+    if not text:
+        return []
+    return [{"source": file.name, "location": "Document", "text": text}]
+
+
+def extract_pptx(file):
+    file.seek(0)
+    presentation = Presentation(file)
+    passages = []
+    for number, slide in enumerate(presentation.slides, start=1):
+        lines = []
+        for shape in slide.shapes:
+            if getattr(shape, "has_table", False) and shape.has_table:
+                for row in shape.table.rows:
+                    cells = []
+                    for cell in row.cells:
+                        value = clean_text(cell.text)
+                        if value and (not cells or cells[-1] != value):
+                            cells.append(value)
+                    if cells:
+                        lines.append(" | ".join(cells))
+            elif getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+                value = clean_text(shape.text)
+                if value:
+                    lines.append(value)
+        try:
+            if slide.has_notes_slide:
+                notes = clean_text(slide.notes_slide.notes_text_frame.text)
+                if notes and not notes.isdigit():
+                    lines.append(f"Notes: {notes}")
+        except Exception:
+            pass
+        text = clean_text("\n".join(lines))
+        if text:
+            passages.append(
+                {"source": file.name, "location": f"Slide {number}", "text": text}
+            )
+    return passages
+
+
+def extract_files(files):
+    extractors = {
+        ".pdf": extract_pdf,
+        ".docx": extract_docx,
+        ".pptx": extract_pptx,
+    }
+    passages = []
+    skipped = []
+    unsupported = []
+    for file in files:
+        suffix = os.path.splitext(file.name)[1].lower()
+        extractor = extractors.get(suffix)
+        if extractor is None:
+            unsupported.append(file.name)
+            continue
+        found = extractor(file)
+        if found:
+            passages.extend(found)
+        else:
+            skipped.append(file.name)
+    return passages, skipped, unsupported
+
+
+def chunk_passages(passages):
+    chunks = []
+    for passage in passages:
+        text = passage["text"]
+        if len(text) <= CHUNK_SIZE:
+            chunks.append(dict(passage))
+            continue
+        start = 0
+        part = 1
+        while start < len(text):
+            piece = text[start : start + CHUNK_SIZE].strip()
+            if piece:
+                chunks.append(
+                    {
+                        "source": passage["source"],
+                        "location": f"{passage['location']}, part {part}",
+                        "text": piece,
+                    }
+                )
+                part += 1
+            if start + CHUNK_SIZE >= len(text):
+                break
+            start += CHUNK_SIZE - CHUNK_OVERLAP
     return chunks
 
-def get_vector_store(text_chunks):
+
+def content_for(text):
+    return types.Content(parts=[types.Part.from_text(text=text)])
+
+
+def embed_texts(client, texts, embed_model):
+    vectors = []
+    for offset in range(0, len(texts), EMBED_BATCH):
+        batch = texts[offset : offset + EMBED_BATCH]
+        result = client.models.embed_content(
+            model=embed_model,
+            contents=[content_for(text) for text in batch],
+            config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
+        )
+        embeddings = result.embeddings or []
+        if len(embeddings) != len(batch):
+            raise RuntimeError(
+                "The embedding service returned an unexpected number of vectors."
+            )
+        for embedding in embeddings:
+            values = getattr(embedding, "values", None)
+            if not values:
+                raise RuntimeError("The embedding service returned an empty vector.")
+            vector = np.asarray(values, dtype="float32")
+            if vector.shape[0] > EMBED_DIM:
+                vector = vector[:EMBED_DIM]
+            vectors.append(vector)
+    matrix = np.vstack(vectors).astype("float32")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    return matrix / norms
+
+
+def build_index(vectors):
+    matrix = np.ascontiguousarray(vectors, dtype="float32")
+    index = faiss.IndexFlatIP(matrix.shape[1])
+    index.add(matrix)
+    return index
+
+
+def search_index(index, query_vector, k):
+    scores, ids = index.search(query_vector, k)
+    found = []
+    for score, chunk_id in zip(scores[0], ids[0]):
+        if int(chunk_id) >= 0:
+            found.append((int(chunk_id), float(score)))
+    return found
+
+
+def generate_text(client, chat_model, prompt):
+    response = client.models.generate_content(model=chat_model, contents=prompt)
+    text = (getattr(response, "text", None) or "").strip()
+    if not text:
+        raise RuntimeError("The model returned an empty response.")
+    return text
+
+
+def labeled_text(chunks, limit=None):
+    parts = []
+    used = 0
+    for chunk in chunks:
+        block = f"[{chunk['source']} — {chunk['location']}]\n{chunk['text']}"
+        if limit is not None and used + len(block) > limit and parts:
+            break
+        parts.append(block)
+        used += len(block)
+    return "\n\n".join(parts)
+
+
+def sample_document(chunks, limit=8000):
+    full = "\n\n".join(chunk["text"] for chunk in chunks)
+    if len(full) <= limit:
+        return full
+    third = max(limit // 3, 1)
+    middle = max(len(full) // 2 - third // 2, 0)
+    return "\n\n".join(
+        [
+            full[:third],
+            full[middle : middle + third],
+            full[-third:],
+        ]
+    )
+
+
+def group_chunks(chunks, limit):
+    groups = []
+    current = []
+    size = 0
+    for chunk in chunks:
+        extra = len(chunk["text"]) + 1
+        if current and size + extra > limit:
+            groups.append(current)
+            current = []
+            size = 0
+        current.append(chunk)
+        size += extra
+    if current:
+        groups.append(current)
+    return groups
+
+
+def summary_instruction(length):
+    if length == "Detailed":
+        return (
+            "Write a detailed summary that keeps the important facts, figures, "
+            "and structure. Use short paragraphs or bullets."
+        )
+    return "Write a concise summary in one short paragraph."
+
+
+def make_brief(client, chat_model, chunks, language):
+    prompt = (
+        f"In 3 to 5 sentences, describe what these documents are about. "
+        f"Write in {language}. Use only the text below.\n\n"
+        f"{sample_document(chunks)}"
+    )
+    return generate_text(client, chat_model, prompt)
+
+
+def make_starters(client, chat_model, chunks, language):
+    prompt = (
+        "Suggest exactly 4 short questions a reader could ask about these documents. "
+        f"Write the questions in {language}. "
+        "Return only the questions, one per line, with no numbering.\n\n"
+        f"{sample_document(chunks, limit=6000)}"
+    )
+    raw = generate_text(client, chat_model, prompt)
+    questions = []
+    for line in raw.splitlines():
+        line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+        if line:
+            questions.append(line)
+    return questions[:4]
+
+
+def summarize_documents(client, chat_model, chunks, language, length):
+    instruction = summary_instruction(length)
+    full = labeled_text(chunks)
+    if len(full) <= SHORT_DOCUMENT_CHARS:
+        prompt = (
+            f"{instruction} Write in {language}. "
+            "Use only the document text below.\n\n"
+            f"{full}"
+        )
+        return generate_text(client, chat_model, prompt)
+
+    partials = []
+    for group in group_chunks(chunks, SUMMARY_GROUP_CHARS):
+        prompt = (
+            "Summarize this part of a longer document. Keep names, dates, and figures. "
+            f"Write in {language}.\n\n{labeled_text(group)}"
+        )
+        partials.append(generate_text(client, chat_model, prompt))
+    combined = "\n\n".join(
+        f"Part {number}:\n{text}" for number, text in enumerate(partials, start=1)
+    )
+    prompt = (
+        f"Combine these section summaries into one summary. {instruction} "
+        f"Write in {language}. Do not add facts that are not in the section summaries.\n\n"
+        f"{combined}"
+    )
+    return generate_text(client, chat_model, prompt)
+
+
+def history_text(messages):
+    lines = []
+    for message in messages[-HISTORY_TURNS:]:
+        speaker = "User" if message["role"] == "user" else "Assistant"
+        content = message["content"].strip()
+        if len(content) > 800:
+            content = content[:800] + "..."
+        lines.append(f"{speaker}: {content}")
+    return "\n".join(lines)
+
+
+def answer_question(client, chat_model, embed_model, index, chunks, question, language, messages):
+    query = embed_texts(
+        client,
+        [f"task: search result | query: {question}"],
+        embed_model,
+    )
+    hits = search_index(index, query, min(RETRIEVAL_K, len(chunks)))
+    sources = []
+    for chunk_id, score in hits:
+        source = dict(chunks[chunk_id])
+        source["score"] = score
+        sources.append(source)
+    excerpts = "\n\n".join(
+        f"Source: {source['source']} ({source['location']})\n{source['text']}"
+        for source in sources
+    )
+    prior = history_text(messages)
+    prompt = (
+        "Answer the question from the uploaded documents.\n"
+        f"Write the answer in {language}.\n"
+        "Use only the excerpts below. If they do not contain the answer, say that "
+        "the answer is not available in the documents. Do not invent facts.\n\n"
+        f"Conversation so far:\n{prior or '(none)'}\n\n"
+        f"Excerpts:\n{excerpts}\n\n"
+        f"Question: {question}"
+    )
+    return generate_text(client, chat_model, prompt), sources
+
+
+def synthesize_speech(text, lang):
+    spoken = text.strip()
+    truncated = len(spoken) > TTS_CHAR_LIMIT
+    if truncated:
+        spoken = spoken[:TTS_CHAR_LIMIT]
+    audio = io.BytesIO()
+    gTTS(text=spoken, lang=lang).write_to_fp(audio)
+    return audio.getvalue(), truncated
+
+
+def init_state():
+    defaults = {
+        "messages": [],
+        "index": None,
+        "chunks": [],
+        "skipped": [],
+        "truncated": False,
+        "brief": "",
+        "starters": [],
+        "notes": [],
+        "uploader_key": 0,
+        "notice": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_documents():
+    st.session_state.messages = []
+    st.session_state.index = None
+    st.session_state.chunks = []
+    st.session_state.skipped = []
+    st.session_state.truncated = False
+    st.session_state.brief = ""
+    st.session_state.starters = []
+    st.session_state.notes = []
+    st.session_state.uploader_key += 1
+
+
+def index_documents(client, chat_model, embed_model, files, language):
+    passages, skipped, unsupported = extract_files(files)
+    if unsupported:
+        names = ", ".join(unsupported)
+        raise DocumentError(f"These files are not supported: {names}")
+    if not passages:
+        raise DocumentError(
+            "No readable text was found. Scanned pages and images are not supported yet."
+        )
+    chunks = chunk_passages(passages)
+    truncated = len(chunks) > MAX_CHUNKS
+    if truncated:
+        chunks = chunks[:MAX_CHUNKS]
+    embed_inputs = [
+        f"title: {chunk['source']} | text: {chunk['text']}" for chunk in chunks
+    ]
+    vectors = embed_texts(client, embed_inputs, embed_model)
+    index = build_index(vectors)
+    notes = []
+    if skipped:
+        notes.append(
+            "No text found in "
+            + ", ".join(skipped)
+            + ". Scanned pages and images are not supported yet."
+        )
+    if truncated:
+        notes.append(
+            f"Only the first {MAX_CHUNKS} sections were indexed so this session stays responsive."
+        )
+    brief = ""
+    starters = []
     try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-        vector_store.save_local("faiss_index")
-    except Exception as e:
-        st.error(f"Error creating vector store: {e}")
-        raise
-
-def get_conversational_chain():
-    prompt_template = """
-    Answer the question as detailed as possible from the provided context, make sure to provide all the details. If the answer is not in
-    the provided context just say, "answer is not available in the context", don't provide the wrong answer.\n\n
-    Context:\n {context}?\n
-    Question: \n{question}\n
-
-    Answer:
-    """
-
-    model = ChatGoogleGenerativeAI(model="models/gemini-pro", temperature=0.3)
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-
-    return chain
-
-def get_summary(text):
-    summary_prompt = """
-    Summarize the following text into a concise summary:\n\n
-    {context}
-    """
-    
-    prompt = PromptTemplate(template=summary_prompt, input_variables=["context"])
-    model = ChatGoogleGenerativeAI(model="models/gemini-pro", temperature=0.3)
-    chain = LLMChain(prompt=prompt, llm=model)
-    
+        brief = make_brief(client, chat_model, chunks, language)
+    except Exception:
+        notes.append("A short brief could not be generated. You can still ask questions.")
     try:
-        summary = chain.run({"context": text})
-        return summary
-    except Exception as e:
-        st.error(f"Error generating summary: {e}")
-        return "Error generating summary."
+        starters = make_starters(client, chat_model, chunks, language)
+    except Exception:
+        notes.append("Suggested questions could not be generated.")
+    return {
+        "index": index,
+        "chunks": chunks,
+        "skipped": skipped,
+        "truncated": truncated,
+        "brief": brief,
+        "starters": starters,
+        "notes": notes,
+    }
 
-def user_input(user_question, language_code, context):
+
+def store_index(result):
+    st.session_state.index = result["index"]
+    st.session_state.chunks = result["chunks"]
+    st.session_state.skipped = result["skipped"]
+    st.session_state.truncated = result["truncated"]
+    st.session_state.brief = result["brief"]
+    st.session_state.starters = result["starters"]
+    st.session_state.notes = result["notes"]
+    st.session_state.messages = []
+
+
+def append_exchange(question, answer, sources, lang, kind="answer"):
+    st.session_state.messages.append({"role": "user", "content": question})
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+            "lang": lang,
+            "kind": kind,
+        }
+    )
+
+
+def render_sources(sources):
+    if not sources:
+        return
+    with st.expander("Sources"):
+        for source in sources:
+            st.markdown(f"**{source['source']}** · {source['location']}")
+            excerpt = source["text"].strip()
+            if len(excerpt) > 500:
+                excerpt = excerpt[:500] + "..."
+            st.caption(excerpt)
+
+
+def render_messages():
+    for index, message in enumerate(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            if message.get("kind") == "summary":
+                st.caption("Summary")
+            st.markdown(message["content"])
+            if message["role"] != "assistant":
+                continue
+            render_sources(message.get("sources") or [])
+            if st.button("Listen", key=f"listen-{index}"):
+                try:
+                    audio, truncated = synthesize_speech(
+                        message["content"], message.get("lang", "en")
+                    )
+                    message["audio"] = audio
+                    message["audio_truncated"] = truncated
+                except Exception as exc:
+                    st.error(f"Could not play that reply. {public_error(exc)}")
+            if message.get("audio"):
+                st.audio(message["audio"], format="audio/mp3")
+                if message.get("audio_truncated"):
+                    st.caption("The recording covers the start of this reply.")
+
+
+def render_empty_state():
+    st.subheader("Ask a document something")
+    first, second, third = st.columns(3)
+    first.markdown("**1. Upload**\n\nAdd PDF, Word, or PowerPoint files in the sidebar.")
+    second.markdown("**2. Process**\n\nBuild a private index for this browser session.")
+    third.markdown("**3. Ask**\n\nChat, summarize, or listen to the reply.")
+
+
+def sidebar(api_key, client, chat_model, embed_model):
+    st.header("Documents")
+    uploads = st.file_uploader(
+        "Upload PDF, DOCX, or PPTX files",
+        type=["pdf", "docx", "pptx"],
+        accept_multiple_files=True,
+        key=f"uploads-{st.session_state.uploader_key}",
+    )
+    language_code = st.selectbox(
+        "Answer language",
+        options=list(LANGUAGES),
+        format_func=lambda code: LANGUAGES[code],
+    )
+    summary_length = st.radio(
+        "Summary length",
+        options=["Brief", "Detailed"],
+        horizontal=True,
+    )
+    ready = bool(api_key and uploads)
+    if st.button(
+        "Process documents",
+        type="primary",
+        disabled=not ready,
+        width="stretch",
+    ):
+        try:
+            with st.spinner("Reading and indexing your files..."):
+                result = index_documents(
+                    client,
+                    chat_model,
+                    embed_model,
+                    uploads,
+                    LANGUAGES[language_code],
+                )
+            store_index(result)
+            st.session_state.notice = "Documents are ready."
+            st.rerun()
+        except DocumentError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Could not process those files. {public_error(exc)}")
+
+    documents_ready = st.session_state.index is not None
+    if st.button(
+        "Summarize",
+        disabled=not (api_key and documents_ready),
+        width="stretch",
+    ):
+        try:
+            with st.spinner("Writing the summary..."):
+                summary = summarize_documents(
+                    client,
+                    chat_model,
+                    st.session_state.chunks,
+                    LANGUAGES[language_code],
+                    summary_length,
+                )
+            append_exchange(
+                f"Summarize the documents ({summary_length.lower()}).",
+                summary,
+                [],
+                language_code,
+                kind="summary",
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not summarize the documents. {public_error(exc)}")
+
+    if documents_ready:
+        st.subheader("In this session")
+        counts = Counter(chunk["source"] for chunk in st.session_state.chunks)
+        for name, count in counts.items():
+            label = "section" if count == 1 else "sections"
+            st.write(f"{name} · {count} {label}")
+        st.caption(f"{len(st.session_state.chunks)} sections indexed")
+        for note in st.session_state.notes:
+            st.warning(note)
+
+    if st.button("Clear chat", width="stretch"):
+        st.session_state.messages = []
+        st.rerun()
+    if st.button("Remove documents", width="stretch"):
+        reset_documents()
+        st.rerun()
+
+    st.divider()
+    st.caption(f"Answers use {chat_model}.")
+    st.caption("This session's index stays in memory and is cleared when you refresh.")
+    if not api_key:
+        st.warning("Add a Google AI Studio key before processing files.")
+    return language_code
+
+
+def ask(client, chat_model, embed_model, question, language_code):
+    question = question.strip()
+    if not question:
+        return
+    if st.session_state.index is None:
+        st.warning("Process documents before asking a question.")
+        return
     try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        docs = new_db.similarity_search(user_question)
-        chain = get_conversational_chain()
-        context_text = " ".join([f"Q: {q} A: {a}" for q, a in context])
-        response = chain({"input_documents": docs, "context": context_text, "question": user_question}, return_only_outputs=True)
-        
-        answer = response["output_text"]
-        context.append((user_question, answer))
-        
-        st.subheader("Reply")
-        st.write(answer)
-        
-        if language_code in LANGUAGES:
-            translated_answer = translator.translate(answer, dest=language_code).text
-            st.subheader("Translated Reply")
-            st.markdown(f"{translated_answer}")
-            
-            tts = gTTS(text=translated_answer, lang=language_code)
-            audio_stream = io.BytesIO()
-            tts.write_to_fp(audio_stream)
-            audio_stream.seek(0)
-            
-            st.audio(audio_stream, format='audio/mp3')
-        else:
-            st.error(f"Invalid language code: {language_code}")
-    except Exception as e:
-        st.error(f"Error during user input processing: {e}")
+        with st.spinner("Looking through the documents..."):
+            answer, sources = answer_question(
+                client,
+                chat_model,
+                embed_model,
+                st.session_state.index,
+                st.session_state.chunks,
+                question,
+                LANGUAGES[language_code],
+                st.session_state.messages,
+            )
+        append_exchange(question, answer, sources, language_code)
+        st.rerun()
+    except Exception as exc:
+        st.error(f'Could not answer "{question}". {public_error(exc)}')
+
 
 def main():
-    st.set_page_config(page_title="DocuEase")
-    st.title("DocuEase📄")
+    st.set_page_config(
+        page_title="DocuEase",
+        page_icon=":material/description:",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    init_state()
+    api_key = read_setting("GOOGLE_API_KEY")
+    chat_model = read_setting("GEMINI_MODEL", DEFAULT_CHAT_MODEL)
+    embed_model = read_setting("EMBED_MODEL", DEFAULT_EMBED_MODEL)
+    client = get_client(api_key) if api_key else None
 
-    st.header("Chat with Document")
-    
-    if "context" not in st.session_state:
-        st.session_state.context = []
-        st.session_state.chat_history = ""
-    
-    uploaded_files = st.file_uploader("Upload your PDF, DOCX, or PPTX files", accept_multiple_files=True)
-    
-    if uploaded_files:
-        text = ""
-        pdf_files = [file for file in uploaded_files if file.name.endswith('.pdf')]
-        docx_files = [file for file in uploaded_files if file.name.endswith('.docx')]
-        pptx_files = [file for file in uploaded_files if file.name.endswith('.pptx')]
+    st.title("DocuEase")
+    st.caption("Ask questions about PDF, Word, and PowerPoint files.")
 
-        if pdf_files:
-            text += extract_text_from_pdf(pdf_files)
-        if docx_files:
-            text += extract_text_from_docx(docx_files)
-        if pptx_files:
-            text += extract_text_from_pptx(pptx_files)
+    with st.sidebar:
+        language_code = sidebar(api_key, client, chat_model, embed_model)
 
-        if st.button("Submit & Process"):
-            with st.spinner("Processing..."):
-                try:
-                    text_chunks = get_text_chunks(text)
-                    get_vector_store(text_chunks)
-                    st.success("Processing complete. You can now ask questions or summarize the document.")
-                except Exception as e:
-                    st.error(f"Error during processing: {e}")
+    notice = st.session_state.notice
+    if notice:
+        st.session_state.notice = None
+        st.success(notice)
 
-        if st.button("Summarize Document"):
-            with st.spinner("Generating summary..."):
-                summary = get_summary(text)
-                st.write("Summary: ", summary)
+    if not api_key:
+        st.warning(
+            "Add `GOOGLE_API_KEY` to `.streamlit/secrets.toml` or a local `.env` file, "
+            "then restart the app. On Streamlit Cloud, paste the same value into the app secrets."
+        )
+        render_empty_state()
+        return
 
-    user_question = st.text_input("Ask a Question from the Documents")
-    language = st.selectbox("Select Language", options=list(LANGUAGES.keys()), format_func=lambda x: LANGUAGES[x])
+    if st.session_state.brief:
+        with st.container(border=True):
+            st.markdown("**Document brief**")
+            st.write(st.session_state.brief)
 
-    if user_question and language:
-        user_input(user_question, language, st.session_state.context)
-        st.session_state.chat_history += f"User: {user_question}\nBot: {st.session_state.context[-1][1]}\n\n"
-        
-    st.text_area("Chat History", value=st.session_state.chat_history, height=400)
+    if st.session_state.index is None and not st.session_state.messages:
+        render_empty_state()
+
+    render_messages()
+
+    show_starters = (
+        st.session_state.index is not None and not st.session_state.messages
+    )
+    if show_starters and st.session_state.starters:
+        st.caption("Suggested questions")
+        left, right = st.columns(2)
+        for number, question in enumerate(st.session_state.starters):
+            column = left if number % 2 == 0 else right
+            if column.button(question, key=f"starter-{number}", width="stretch"):
+                ask(client, chat_model, embed_model, question, language_code)
+
+    prompt = st.chat_input(
+        "Ask a question about the documents",
+        disabled=st.session_state.index is None,
+    )
+    if prompt:
+        ask(client, chat_model, embed_model, prompt, language_code)
+
 
 if __name__ == "__main__":
     main()

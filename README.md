@@ -1,21 +1,77 @@
-# DocuEase : AI-Assistant
+# DocuEase
 
+DocuEase is a Streamlit app for asking questions about PDF, Word, and PowerPoint files. It extracts the text, searches the relevant sections with Gemini embeddings, and answers with Gemini. Replies can be written in several languages and read aloud.
 
-Link : https://docuease.streamlit.app/
+## Features
 
-<h3>About</h3> <br>
-This project involves a Streamlit application called DocuEase that allows users to upload and query the content of PDF, DOCX, and PPTX files using AI technologies. The application extracts text from these files and splits it into chunks for efficient processing. It uses Google Generative AI embeddings and FAISS for vectorization and cosine similarity search, enabling detailed responses to user questions.
-<br> <br>
-Additionally, the app integrates text-to-speech functionality using the gTTS library, allowing responses to be read aloud. The application also features multilingual support, providing answers in different languages based on user preference.This project demonstrates an interactive interface for document querying and response generation, enhanced by text-to-speech and multilingual capabilities.
+- Chat with one or more PDF, DOCX, and PPTX files
+- Answers grounded in the uploaded text, with the file and page or slide shown
+- Brief and detailed summaries, including long documents split into sections
+- English, Spanish, French, German, Simplified Chinese, and Hindi
+- Optional spoken replies
+- A private in-memory index for each browser session
 
+## Run locally
 
-<h3>Features</h3> <br>
-<em>Interactive Chat : </em> Engage in real-time conversations to retrieve and understand document content effortlessly. <br> <br>
-<em>Summarization : </em> Quickly condense information from PDFs, PowerPoints, and Word documents<br> <br>
-<em>Voice Integration : </em> Utilizes Google Text-to-Speech for auditory responses, aiding users who prefer listening or have visual impairments. <br> <br>
-<em>Multilingual Support : </em> Offers answers in multiple languages using AI translation, catering to non-native English speakers and documents in various languages. <br> <br>
+Python 3.11 or newer.
 
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
+Add a [Google AI Studio](https://aistudio.google.com/apikey) key in `.streamlit/secrets.toml`:
 
+```toml
+GOOGLE_API_KEY = "your-key"
+```
 
+A `.env` file works as well:
 
+```text
+GOOGLE_API_KEY=your-key
+```
+
+Copy [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example) if you want the optional model names too. Start the app:
+
+```powershell
+streamlit run app.py
+```
+
+Open http://localhost:8501. Upload files, choose **Process documents**, then ask a question.
+
+## Deploy on Streamlit Community Cloud
+
+1. Push this repository to GitHub. Do not commit the API key.
+2. Open [share.streamlit.io](https://share.streamlit.io) and create an app from `Tanmay-57/DocuEase-AI-Assistant`, branch `main`, main file `app.py`.
+3. In Advanced settings, paste:
+
+```toml
+GOOGLE_API_KEY = "your-key"
+```
+
+4. Deploy. Set the app to private if other people should not spend your Gemini quota.
+
+Optional secret overrides:
+
+```toml
+GEMINI_MODEL = "gemini-3.8-flash"
+EMBED_MODEL = "gemini-embedding-2"
+```
+
+A public app uses your key for every visitor.
+
+## Notes
+
+- Scanned PDFs and pictures of text are not read.
+- Word tables, PowerPoint tables, and speaker notes are included.
+- Refreshing the page clears the uploaded files and the conversation.
+- Very large uploads index the first 400 sections and say so in the sidebar.
+
+## Project layout
+
+- `app.py` — the Streamlit application
+- `requirements.txt` — Python dependencies
+- `.streamlit/config.toml` — theme and the 50 MB upload limit
+- `.streamlit/secrets.toml.example` — secret names, with no real key
