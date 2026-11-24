@@ -56,7 +56,7 @@ GOOGLE_API_KEY = "your-key"
 Optional secret overrides:
 
 ```toml
-# Optional. Answers use gemini-3.8-flash unless this is set.
+# Optional. Answers use gemini-3.5-flash-lite unless this is set.
 # GEMINI_MODEL = "gemini-3.5-flash-lite"
 # EMBED_MODEL = "gemini-embedding-2"
 ```

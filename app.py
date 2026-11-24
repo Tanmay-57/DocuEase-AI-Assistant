@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import time
 import tomllib
 from collections import Counter
 from collections.abc import Mapping
@@ -18,7 +19,7 @@ from gtts import gTTS
 from pptx import Presentation
 from pypdf import PdfReader
 
-DEFAULT_ANSWER_MODEL = "gemini-3.8-flash"
+DEFAULT_ANSWER_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_SUMMARY_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768
@@ -88,11 +89,18 @@ class DocumentError(Exception):
     """A problem the user can fix by choosing different files."""
 
 
+def model_is_busy(exc):
+    message = str(exc).upper()
+    return any(token in message for token in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+
+
 def public_error(exc):
     message = " ".join(str(exc).split())
     message = re.sub(r"[A-Za-z0-9._\-]{24,}", "[hidden]", message)
     if "API_KEY_INVALID" in message or "API key not valid" in message:
         return "The Google API key was rejected. Check GOOGLE_API_KEY in the Streamlit Cloud secrets."
+    if model_is_busy(exc):
+        return "The model is busy right now. Wait a moment and try the question again."
     if len(message) > 280:
         message = message[:280] + "..."
     return message
@@ -416,7 +424,7 @@ def search_index(index, query_vector, k):
     return found
 
 
-def generate_text(client, chat_model, prompt, thinking_level=types.ThinkingLevel.MINIMAL):
+def _generate_once(client, chat_model, prompt, thinking_level):
     config = types.GenerateContentConfig(
         thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
     )
@@ -432,6 +440,21 @@ def generate_text(client, chat_model, prompt, thinking_level=types.ThinkingLevel
     if not text:
         raise RuntimeError("The model returned an empty response.")
     return text
+
+
+def generate_text(client, chat_model, prompt, thinking_level=types.ThinkingLevel.MINIMAL):
+    try:
+        return _generate_once(client, chat_model, prompt, thinking_level)
+    except Exception as exc:
+        if not model_is_busy(exc):
+            raise
+    time.sleep(2)
+    try:
+        return _generate_once(client, chat_model, prompt, thinking_level)
+    except Exception as exc:
+        if chat_model == DEFAULT_SUMMARY_MODEL or not model_is_busy(exc):
+            raise
+    return _generate_once(client, DEFAULT_SUMMARY_MODEL, prompt, thinking_level)
 
 
 def labeled_text(chunks, limit=None):
