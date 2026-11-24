@@ -30,8 +30,9 @@ CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
 MAX_CHUNKS = 400
 RETRIEVAL_K = 8
-SUMMARY_GROUP_CHARS = 8000
-SHORT_DOCUMENT_CHARS = 12000
+SUMMARY_GROUP_CHARS = 40000
+SINGLE_SUMMARY_CHARS = 160000
+SUMMARY_PAUSE_SECONDS = 6
 HISTORY_TURNS = 6
 TTS_CHAR_LIMIT = 4500
 
@@ -444,18 +445,20 @@ def _generate_once(client, chat_model, prompt, thinking_level):
 
 
 def generate_text(client, chat_model, prompt, thinking_level=types.ThinkingLevel.MINIMAL):
-    try:
-        return _generate_once(client, chat_model, prompt, thinking_level)
-    except Exception as exc:
-        if not model_is_busy(exc):
-            raise
-    time.sleep(2)
-    try:
-        return _generate_once(client, chat_model, prompt, thinking_level)
-    except Exception as exc:
-        if chat_model == DEFAULT_SUMMARY_MODEL or not model_is_busy(exc):
-            raise
-    return _generate_once(client, DEFAULT_SUMMARY_MODEL, prompt, thinking_level)
+    delay = 4
+    last_error = None
+    for attempt in range(3):
+        try:
+            return _generate_once(client, chat_model, prompt, thinking_level)
+        except Exception as exc:
+            last_error = exc
+            if not model_is_busy(exc) or attempt == 2:
+                break
+            time.sleep(delay)
+            delay *= 2
+    if chat_model != DEFAULT_SUMMARY_MODEL and model_is_busy(last_error):
+        return _generate_once(client, DEFAULT_SUMMARY_MODEL, prompt, thinking_level)
+    raise last_error
 
 
 def labeled_text(chunks, limit=None):
@@ -504,11 +507,12 @@ def summarize_group(client, chat_model, group, language):
     return generate_text(client, chat_model, prompt)
 
 
-def summarize_documents(client, chat_model, chunks, language, length):
+def summarize_documents(client, chat_model, chunks, language, length, on_progress=None):
     instruction = summary_instruction(length)
     full = labeled_text(chunks)
-    groups = group_chunks(chunks, SUMMARY_GROUP_CHARS)
-    if len(full) <= SHORT_DOCUMENT_CHARS or len(groups) == 1:
+    if len(full) <= SINGLE_SUMMARY_CHARS:
+        if on_progress:
+            on_progress(1, 1)
         prompt = (
             f"{instruction} Write in {language}. "
             "Use only the document text below.\n\n"
@@ -516,14 +520,17 @@ def summarize_documents(client, chat_model, chunks, language, length):
         )
         return generate_text(client, chat_model, prompt)
 
-    workers = min(EMBED_WORKERS, len(groups))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        partials = list(
-            pool.map(
-                lambda group: summarize_group(client, chat_model, group, language),
-                groups,
-            )
-        )
+    groups = group_chunks(chunks, SUMMARY_GROUP_CHARS)
+    partials = []
+    total = len(groups) + 1
+    for index, group in enumerate(groups, start=1):
+        if on_progress:
+            on_progress(index, total)
+        partials.append(summarize_group(client, chat_model, group, language))
+        if index < len(groups):
+            time.sleep(SUMMARY_PAUSE_SECONDS)
+    if on_progress:
+        on_progress(total, total)
     combined = "\n\n".join(
         f"Part {number}:\n{text}" for number, text in enumerate(partials, start=1)
     )
@@ -959,15 +966,23 @@ def sidebar(api_key, client, answer_model, summary_model, embed_model, secret_pr
         disabled=not (api_key and documents_ready),
         width="stretch",
     ):
+        progress = st.empty()
         try:
-            with st.spinner("Writing the summary..."):
-                summary = summarize_documents(
-                    client,
-                    summary_model,
-                    st.session_state.chunks,
-                    LANGUAGES[language_code],
-                    summary_length,
-                )
+
+            def on_progress(done, total):
+                if total == 1:
+                    progress.caption("Writing the summary...")
+                else:
+                    progress.caption(f"Summarizing part {done} of {total}...")
+
+            summary = summarize_documents(
+                client,
+                summary_model,
+                st.session_state.chunks,
+                LANGUAGES[language_code],
+                summary_length,
+                on_progress=on_progress,
+            )
             append_exchange(
                 f"Summarize the documents ({summary_length.lower()}).",
                 summary,
@@ -978,6 +993,8 @@ def sidebar(api_key, client, answer_model, summary_model, embed_model, secret_pr
             st.rerun()
         except Exception as exc:
             st.error(f"Could not summarize the documents. {public_error(exc)}")
+        finally:
+            progress.empty()
 
     if documents_ready:
         st.caption("In this session")
