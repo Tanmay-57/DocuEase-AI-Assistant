@@ -1,3 +1,4 @@
+import html
 import io
 import os
 import re
@@ -703,6 +704,92 @@ def append_exchange(question, answer, sources, lang, kind="answer"):
     )
 
 
+APP_CSS = """
+<style>
+[data-testid="stHeader"], [data-testid="stToolbar"] { background: transparent; }
+[data-testid="stToolbar"] { visibility: hidden; }
+footer, #MainMenu { visibility: hidden; }
+[data-testid="stAppViewContainer"], .stApp { background: #ffffff; }
+section[data-testid="stSidebar"] {
+  background: #f7f7f8;
+  border-right: 1px solid #ececef;
+}
+section[data-testid="stSidebar"] > div { padding-top: 1.1rem; }
+.block-container {
+  max-width: 760px;
+  padding-top: 0.6rem;
+  padding-bottom: 6.5rem;
+}
+.de-hero { text-align: center; padding: 7vh 0 1.25rem; }
+.de-mark {
+  width: 52px; height: 52px; margin: 0 auto 0.9rem; border-radius: 16px;
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-weight: 650; font-size: 1.3rem;
+  background: linear-gradient(135deg, #1a73e8, #7b4dff);
+}
+.de-hero h1 {
+  margin: 0; font-size: 2.35rem; font-weight: 560; letter-spacing: -0.035em; line-height: 1.15;
+  background: linear-gradient(90deg, #1a73e8 0%, #7b4dff 58%, #d946ef 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.de-hero p { margin: 0.65rem auto 0; max-width: 34rem; color: #6b6b6b; font-size: 1.02rem; }
+.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.7rem; margin-top: 1.4rem; }
+.steps div {
+  text-align: left; border: 1px solid #ececef; border-radius: 16px;
+  padding: 0.85rem 0.95rem; background: #fff;
+}
+.steps strong { display: block; margin-bottom: 0.25rem; font-size: 0.92rem; }
+.steps span { color: #6b6b6b; font-size: 0.86rem; line-height: 1.35; }
+.user-bubble {
+  background: #f4f4f5; color: #1f1f1f; border-radius: 20px;
+  padding: 0.72rem 1rem; margin-left: auto; width: fit-content; max-width: 100%;
+  white-space: pre-wrap; line-height: 1.45;
+}
+.assistant-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 0.9rem;
+  background: linear-gradient(135deg, #1a73e8, #7b4dff);
+}
+[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.assistant-avatar) > div:first-child {
+  flex: 0 0 40px !important;
+  min-width: 40px;
+  max-width: 40px;
+}
+.doc-pills { display: flex; flex-wrap: wrap; gap: 0.4rem; justify-content: center; margin: 0.15rem 0 0.4rem; }
+.doc-pills span {
+  border: 1px solid #ececef; background: #fff; border-radius: 999px;
+  padding: 0.22rem 0.7rem; font-size: 0.8rem; color: #444;
+}
+.side-brand { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.02em; margin: 0; }
+[data-testid="stFileUploader"] section { border-radius: 14px; background: #fff; }
+[data-testid="stAlert"] { border-radius: 14px; }
+[data-testid="stMain"] [data-testid="stBaseButton-secondary"] {
+  border-radius: 16px; border: 1px solid #ececef; background: #fff;
+  text-align: left; min-height: 4.1rem; padding: 0.7rem 0.9rem;
+  white-space: normal; line-height: 1.35;
+}
+[data-testid="stMain"] [data-testid="stBaseButton-secondary"]:hover {
+  background: #f7f7f8; border-color: #d5d5dc;
+}
+[data-testid="stChatInput"] { max-width: 760px; }
+[data-testid="stChatInput"] > div {
+  border-radius: 28px; border: 1px solid #e3e3e8; background: #fff;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
+}
+@media (max-width: 700px) {
+  .steps { grid-template-columns: 1fr; }
+  .de-hero h1 { font-size: 1.8rem; }
+  .de-hero { padding-top: 2.2rem; }
+}
+</style>
+"""
+
+
+def inject_styles():
+    st.markdown(APP_CSS, unsafe_allow_html=True)
+
+
 def render_sources(sources):
     if not sources:
         return
@@ -717,14 +804,27 @@ def render_sources(sources):
 
 def render_messages():
     for index, message in enumerate(st.session_state.messages):
-        with st.chat_message(message["role"]):
+        if message["role"] == "user":
+            _, bubble = st.columns([0.18, 0.82])
+            safe = html.escape(message["content"])
+            bubble.markdown(
+                f'<div class="user-bubble">{safe}</div>',
+                unsafe_allow_html=True,
+            )
+            continue
+        avatar, body = st.columns([0.08, 0.92], vertical_alignment="top")
+        avatar.markdown('<div class="assistant-avatar">✦</div>', unsafe_allow_html=True)
+        with body:
             if message.get("kind") == "summary":
                 st.caption("Summary")
             st.markdown(message["content"])
-            if message["role"] != "assistant":
-                continue
             render_sources(message.get("sources") or [])
-            if st.button("Listen", key=f"listen-{index}"):
+            if st.button(
+                "Listen",
+                key=f"listen-{index}",
+                icon=":material/volume_up:",
+                type="tertiary",
+            ):
                 try:
                     audio, truncated = synthesize_speech(
                         message["content"], message.get("lang", "en")
@@ -739,32 +839,67 @@ def render_messages():
                     st.caption("The recording covers the start of this reply.")
 
 
-def render_empty_state():
-    st.subheader("Ask a document something")
-    first, second, third = st.columns(3)
-    first.markdown("**1. Upload**\n\nAdd PDF, Word, or PowerPoint files in the sidebar.")
-    second.markdown("**2. Process**\n\nBuild a private index for this browser session.")
-    third.markdown("**3. Ask**\n\nChat, summarize, or listen to the reply.")
+def render_doc_pills():
+    counts = Counter(chunk["source"] for chunk in st.session_state.chunks)
+    if not counts:
+        return
+    chips = "".join(f"<span>{html.escape(name)}</span>" for name in counts)
+    st.markdown(f'<div class="doc-pills">{chips}</div>', unsafe_allow_html=True)
+
+
+def render_hero(indexed):
+    if indexed:
+        subtitle = "Ask a question, or start from one of the suggestions."
+    else:
+        subtitle = "Add a PDF, Word, or PowerPoint file, then start the conversation."
+    st.markdown(
+        f"""
+        <div class="de-hero">
+          <div class="de-mark">D</div>
+          <h1>What do you want to know?</h1>
+          <p>{subtitle}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not indexed:
+        st.markdown(
+            """
+            <div class="steps">
+              <div><strong>1. Add files</strong><span>Use the sidebar for PDF, Word, or PowerPoint.</span></div>
+              <div><strong>2. Process</strong><span>Build a private index for this session.</span></div>
+              <div><strong>3. Ask</strong><span>Chat, summarize, or listen to a reply.</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def sidebar(api_key, client, answer_model, summary_model, embed_model, secret_problems, secret_names):
-    st.header("Documents")
+    st.markdown('<p class="side-brand">DocuEase</p>', unsafe_allow_html=True)
+    st.caption("Chat with your documents")
+    if st.button("New chat", icon=":material/edit:", width="stretch"):
+        st.session_state.messages = []
+        st.rerun()
+    st.caption("Documents")
     uploads = st.file_uploader(
         "Upload PDF, DOCX, or PPTX files",
         type=["pdf", "docx", "pptx"],
         accept_multiple_files=True,
         key=f"uploads-{st.session_state.uploader_key}",
+        label_visibility="collapsed",
     )
-    language_code = st.selectbox(
-        "Answer language",
-        options=list(LANGUAGES),
-        format_func=lambda code: LANGUAGES[code],
-    )
-    summary_length = st.radio(
-        "Summary length",
-        options=["Brief", "Detailed"],
-        horizontal=True,
-    )
+    with st.expander("Reply settings"):
+        language_code = st.selectbox(
+            "Answer language",
+            options=list(LANGUAGES),
+            format_func=lambda code: LANGUAGES[code],
+        )
+        summary_length = st.radio(
+            "Summary length",
+            options=["Brief", "Detailed"],
+            horizontal=True,
+        )
     ready = bool(api_key and uploads)
     if st.button(
         "Process documents",
@@ -839,25 +974,19 @@ def sidebar(api_key, client, answer_model, summary_model, embed_model, secret_pr
             st.error(f"Could not summarize the documents. {public_error(exc)}")
 
     if documents_ready:
-        st.subheader("In this session")
+        st.caption("In this session")
         counts = Counter(chunk["source"] for chunk in st.session_state.chunks)
         for name, count in counts.items():
             label = "section" if count == 1 else "sections"
-            st.write(f"{name} · {count} {label}")
-        st.caption(f"{len(st.session_state.chunks)} sections indexed")
+            st.caption(f"{name} · {count} {label}")
         for note in st.session_state.notes:
             st.warning(note)
 
-    if st.button("Clear chat", width="stretch"):
-        st.session_state.messages = []
-        st.rerun()
-    if st.button("Remove documents", width="stretch"):
+    if st.button("Remove documents", type="tertiary", width="stretch"):
         reset_documents()
         st.rerun()
 
-    st.divider()
     st.caption(f"Answers use {answer_model}.")
-    st.caption("This session's index stays in memory and is cleared when you refresh.")
     return language_code
 
 
@@ -889,10 +1018,11 @@ def ask(client, chat_model, embed_model, question, language_code):
 def main():
     st.set_page_config(
         page_title="DocuEase",
-        page_icon=":material/description:",
-        layout="wide",
+        page_icon=":material/auto_awesome:",
+        layout="centered",
         initial_sidebar_state="expanded",
     )
+    inject_styles()
     init_state()
     secrets, secret_problems = load_secrets()
     api_key = api_key_from(secrets)
@@ -900,9 +1030,6 @@ def main():
     summary_model = DEFAULT_SUMMARY_MODEL
     embed_model = secrets.get("EMBED_MODEL") or DEFAULT_EMBED_MODEL
     client = get_client(api_key) if api_key else None
-
-    st.title("DocuEase")
-    st.caption("Ask questions about PDF, Word, and PowerPoint files.")
 
     with st.sidebar:
         language_code = sidebar(
@@ -918,41 +1045,35 @@ def main():
     notice = st.session_state.notice
     if notice:
         st.session_state.notice = None
-        st.success(notice)
+        st.toast(notice)
 
     if not api_key:
         st.warning(
-            "This deployed app cannot see GOOGLE_API_KEY. "
-            "Open the app in Streamlit Cloud, choose Settings, then Secrets, and save "
+            "This app cannot see GOOGLE_API_KEY. "
+            "In Streamlit Cloud, open Settings, then Secrets, and save "
             '`GOOGLE_API_KEY = "your-key"`. Reboot the app after saving.'
         )
-        render_empty_state()
+        render_hero(False)
         return
 
-    if st.session_state.brief:
-        with st.container(border=True):
-            st.markdown("**Document brief**")
-            st.write(st.session_state.brief)
-
-    if st.session_state.index is None and not st.session_state.messages:
-        render_empty_state()
+    indexed = st.session_state.index is not None
+    if indexed:
+        render_doc_pills()
+    if not st.session_state.messages:
+        render_hero(indexed)
 
     render_messages()
 
-    show_starters = (
-        st.session_state.index is not None and not st.session_state.messages
-    )
-    if show_starters and st.session_state.starters:
-        st.caption("Suggested questions")
+    if indexed and not st.session_state.messages and st.session_state.starters:
         left, right = st.columns(2)
         for number, question in enumerate(st.session_state.starters):
             column = left if number % 2 == 0 else right
-            if column.button(question, key=f"starter-{number}", width="stretch"):
+            if column.button(question, key=f"starter-{number}", width="stretch", wrap=True):
                 ask(client, answer_model, embed_model, question, language_code)
 
     prompt = st.chat_input(
-        "Ask a question about the documents",
-        disabled=st.session_state.index is None,
+        "Ask about your documents" if indexed else "Process a document to start chatting",
+        disabled=not indexed,
     )
     if prompt:
         ask(client, answer_model, embed_model, prompt, language_code)
