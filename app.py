@@ -706,8 +706,14 @@ def append_exchange(question, answer, sources, lang, kind="answer"):
 
 APP_CSS = """
 <style>
-[data-testid="stHeader"], [data-testid="stToolbar"] { background: transparent; }
-[data-testid="stToolbar"] { visibility: hidden; }
+[data-testid="stHeader"] { background: transparent; }
+[data-testid="stExpandSidebarButton"] {
+  visibility: visible;
+  background: #ffffff;
+  border: 1px solid #e6e6e6;
+  border-radius: 10px;
+  color: #1f1f1f;
+}
 footer, #MainMenu { visibility: hidden; }
 [data-testid="stAppViewContainer"], .stApp { background: #ffffff; }
 section[data-testid="stSidebar"] {
